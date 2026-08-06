@@ -1,0 +1,7 @@
+# benchmark outputs — never pushed
+results/
+__pycache__/
+*.pyc
+*.log
+*.out
+*.raw
