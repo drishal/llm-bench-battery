@@ -1,0 +1,1580 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63f3a7b..ab6d3c9 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4118,6 +4118,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.n_min = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
++    add_opt(common_arg(
++        {"--spec-draft-depth-max"}, "N",
++        string_format("stop drafting once the sequence is longer than N tokens, 0 = never (default: %d)", params.speculative.draft.n_depth_max),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_depth_max = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEPTH_MAX"));
++    add_opt(common_arg(
++        {"--spec-draft-window"}, "N",
++        string_format("draft (MTP) context keeps only the last N rows, so its cache stays small and a draft pass costs\n"
++                      "the same at any depth; 0 = full history (default: %d)", params.speculative.draft.n_window),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_window = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
++    add_opt(common_arg(
++        {"--spec-draft-n-max-tail"}, "N",
++        string_format("draft size once the sequence reaches --kv-vram-cells, where a wider verify reads the host tail\n"
++                      "once for all columns; 0 = --spec-draft-n-max (default: %d)", params.speculative.draft.n_max_tail),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_max_tail = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_TAIL"));
++    add_opt(common_arg(
++        {"--spec-lookup-n-max"}, "N",
++        string_format("draft size for the lookup drafters (ngram-*) listed with a model drafter in --spec-type: they\n"
++                      "draft text already in the context, the model drafter keeps --spec-draft-n-max; 0 = same (default: %d)",
++                      params.speculative.draft.n_max_lookup),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_max_lookup = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_LOOKUP_N_MAX"));
+ 
+     add_opt(common_arg(
+         {"--spec-draft-p-split", "--draft-p-split"}, "P",
+diff --git a/common/common.h b/common/common.h
+index eb50a6c..3300867 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -329,6 +329,27 @@ struct common_params_speculative_draft {
+     float p_split = 0.1f; // speculative decoding split probability
+     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+ 
++    // stop drafting once the sequence is this long (0 = never). Measured when a deep verify batch ran on the
++    // vector FA kernel and the draft context grew with the conversation (Bonsai 2 27B on a 4070: +85% at zero
++    // depth, even near 24k, -30% at 64k). With quantized-KV decode on the MMA FA kernel and n_window below,
++    // drafting pays at every depth (64k: 48 -> 90 tok/s), so the server default is 0.
++    int32_t n_depth_max = 0;
++
++    // draft (MTP) context window (0 = full history): it keeps only the last n_window rows and is sized for
++    // them, so its cells are reused, its cache stays small and on the device, and a draft pass costs the same
++    // at any depth. The MTP head predicts the next few tokens from recent context: 16k rows accept as many
++    // drafts as the full history at 131k.
++    int32_t n_window = 0;
++
++    // draft size once the sequence reaches the tiered-KV line (--kv-vram-cells; 0 = n_max). Past it a step
++    // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
++    int32_t n_max_tail = 0;
++
++    // draft size for the lookup drafters (ngram-*; 0 = the same limit as the model drafter). A lookup draft copies
++    // text that is already in the context, so a long draft is cheap and usually accepted; the model drafter (MTP)
++    // keeps --spec-draft-n-max, where long drafts cost more than they save.
++    int32_t n_max_lookup = 0;
++
+     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+ 
+     common_params_model mparams;
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e..dd5b148 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cinttypes>
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
+@@ -614,6 +615,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         if (id != LLAMA_TOKEN_NULL) {
+             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
+ 
++            {
++                const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++                if (id < 0 || id >= n_vocab) {
++                    // diagnostic: a backend-sampled id outside the vocab would otherwise surface much later as a
++                    // std::vector::at() throw in the tokenizer ("invalid vector subscript"). log the origin and
++                    // fall back to the CPU chain on the (already fetched) logits/candidates.
++                    LOG_ERR("%s: backend sampler returned out-of-vocab token id %d (idx=%d, n_vocab=%d, cur_p.size=%zu, cur_p[0].id=%d) - falling back to CPU sampling\n",
++                            __func__, id, idx, n_vocab, cur_p.size, cur_p.size > 0 ? cur_p.data[0].id : -1);
++                    id = LLAMA_TOKEN_NULL;
++                }
++            }
++        }
++
++        if (id != LLAMA_TOKEN_NULL) {
++
+             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+ 
+@@ -639,6 +655,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ 
+     id = cur_p.data[cur_p.selected].id;
+ 
++    {
++        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        if (id < 0 || id >= n_vocab) {
++            LOG_ERR("%s: CPU chain selected out-of-vocab token id %d (idx=%d, n_vocab=%d, selected=%" PRId64 ", cur_p.size=%zu) - candidate ids from the backend are corrupt\n",
++                    __func__, id, idx, n_vocab, cur_p.selected, cur_p.size);
++        }
++    }
++
+     if (grammar_first || !grammar_should_apply(gsmpl)) {
+         return id;
+     }
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index ebde17e..824dbff 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2133,6 +2133,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // Deferred catch-up (single head, separate draft memory). process() used to run the draft
++    // over every row of the target's verify batch right away, only to fill the draft's memory:
++    // one extra graph launch per step, spent partly on rows the target then rejects. Instead the
++    // rows are kept here and decoded at the start of draft() in the same llama_decode as the
++    // first draft row (positions are contiguous, the draft row attends to them in-batch).
++    // accept() trims n_valid to the accepted prefix; without an accept() every row is real.
++    struct deferred_rows {
++        std::vector<llama_token> tokens;
++        std::vector<llama_pos>   pos;
++        std::vector<float>       h;          // n_rows * n_embd, shifted target rows as process() builds them
++        int32_t n_valid = 0;
++        bool    pending = false;
++        bool    catchup_failed = false;      // flush_deferred decode failed; do not draft this seq
++    };
++    std::vector<deferred_rows> deferred;
++
++    bool can_defer() const {
++        return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
++    }
++
++    // decode the deferred rows on their own (fallback for prompts split into tiny ubatches, or a
++    // sequence that stops drafting). Returns false on decode failure.
++    bool flush_deferred(llama_seq_id seq_id) {
++        auto & d = deferred[seq_id];
++        if (!d.pending) {
++            return true;
++        }
++        if (d.n_valid <= 0) {
++            d.pending = false;
++            return true;
++        }
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++        common_batch_clear(batch);
++        for (int32_t k = 0; k < d.n_valid; ++k) {
++            common_batch_add(batch, d.tokens[k], d.pos[k], { seq_id }, false);
++            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, d.h.data() + (size_t) k * n_embd, row_bytes);
++        }
++        const int32_t rc = llama_decode(params.ctx_dft, batch);
++        if (rc != 0) {
++            SPC_ERR("llama_decode(ctx_dft) deferred catch-up failed rc=%d (pos=%d)\n", (int) rc, (int) d.pos[0]);
++            d.catchup_failed = true;
++            return false;
++        }
++        d.pending = false;
++        return true;
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -2210,6 +2257,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++
++        deferred.assign(n_seq, {});
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -2239,6 +2288,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         auto * ctx_dft = this->params.ctx_dft;
++        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
++            // A failed catch-up used to stick for the life of the slot. This task is a new prompt.
++            deferred[seq_id].catchup_failed = false;
++        }
++        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && deferred[seq_id].pending) {
++            // rows left over from the previous task on this slot. They are only worth decoding when they
++            // are the tail of a prefix the new prompt reuses: the same tokens at the same positions, and
++            // positions that directly continue what ctx_dft holds. Otherwise (client cancelled a task,
++            // a different conversation landed on the slot) the server has already trimmed ctx_dft past
++            // them, and decoding them would put stale positions into the recurrent draft state.
++            auto & d = deferred[seq_id];
++            const llama_pos pos_max_dft = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
++            bool reuse = d.n_valid > 0 && d.pos[0] == pos_max_dft + 1;
++            for (int32_t k = 0; reuse && k < d.n_valid; ++k) {
++                reuse = d.pos[k] < N && prompt[d.pos[k]] == d.tokens[k];
++            }
++            if (reuse) {
++                if (!flush_deferred(seq_id)) {
++                    // ctx_dft is not caught up; begin() cannot draft this prompt
++                    return;
++                }
++            } else {
++                d.pending = false;
++                d.n_valid = 0;
++            }
++        }
+         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+ 
+         if (pos_max < N - 1 && !is_mem_shared) {
+@@ -2307,14 +2382,73 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+             };
+ 
++            int n_seq_in_batch = 0;
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 if (i_batch_beg[seq_id] < 0) {
+                     continue;
+                 }
++                n_seq_in_batch++;
+ 
+                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+ 
++            // verify-sized batch of one sequence: hold the rows for draft() instead of decoding now.
++            // A stash that is still pending here belongs to an earlier batch: decode it first if this
++            // batch continues it (prompt fed in small ubatches), drop it if the positions overlap
++            // (the server rolled the sequence back and is replaying).
++            if (can_defer() && n_seq_in_batch == 1 && n_tokens <= this->params.n_max + 1) {
++                const llama_seq_id seq_id = batch_in.seq_id[0][0];
++                auto & d = deferred[seq_id];
++                if (d.pending) {
++                    const bool continues = !d.pos.empty() && batch_in.pos[0] == d.pos[d.n_valid - 1] + 1;
++                    if (continues) {
++                        // flush_deferred() reuses `batch`, so the rows built above are rebuilt below
++                        std::vector<llama_token> tok_save(batch.token, batch.token + n_tokens);
++                        std::vector<llama_pos>   pos_save(batch.pos,   batch.pos   + n_tokens);
++                        std::vector<float>       h_save(batch.embd, batch.embd + (size_t) n_tokens * n_embd);
++                        if (!flush_deferred(seq_id)) {
++                            return false;
++                        }
++                        d.tokens = std::move(tok_save);
++                        d.pos    = std::move(pos_save);
++                        d.h      = std::move(h_save);
++                    } else {
++                        d.pending = false;
++                        d.tokens.assign(batch.token, batch.token + n_tokens);
++                        d.pos.assign(batch.pos, batch.pos + n_tokens);
++                        d.h.assign(batch.embd, batch.embd + (size_t) n_tokens * n_embd);
++                    }
++                } else {
++                    d.tokens.assign(batch.token, batch.token + n_tokens);
++                    d.pos.assign(batch.pos, batch.pos + n_tokens);
++                    d.h.assign(batch.embd, batch.embd + (size_t) n_tokens * n_embd);
++                }
++                d.n_valid = n_tokens;
++                d.pending = true;
++            } else {
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] >= 0 && deferred[seq_id].pending) {
++                    // a large batch after a pending stash: prompt continuation (flush) or rollback replay (drop)
++                    auto & d = deferred[seq_id];
++                    const bool continues = !d.pos.empty() && batch_in.pos[i_batch_beg[seq_id]] == d.pos[d.n_valid - 1] + 1;
++                    if (continues) {
++                        std::vector<llama_token> tok_save(batch.token, batch.token + n_tokens);
++                        std::vector<llama_pos>   pos_save(batch.pos,   batch.pos   + n_tokens);
++                        std::vector<float>       h_save(batch.embd, batch.embd + (size_t) n_tokens * n_embd);
++                        if (!flush_deferred(seq_id)) {
++                            return false;
++                        }
++                        common_batch_clear(batch);
++                        for (int k = 0; k < n_tokens; ++k) {
++                            common_batch_add(batch, tok_save[k], pos_save[k], { batch_in.seq_id[k][0] }, 0);
++                        }
++                        std::memcpy(batch.embd, h_save.data(), row_bytes * n_tokens);
++                    } else {
++                        d.pending = false;
++                    }
++                }
++            }
++
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+@@ -2345,6 +2479,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (!ok) {
+                 return false;
+             }
++            } // eager catch-up
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -2371,13 +2506,66 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        // deferred catch-up rows that do not lead straight into this draft position are decoded
++        // on their own first (uses `batch`, so before it is built)
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            auto & d = deferred[seq_id];
++            auto & dp = dparams[seq_id];
++            if (d.catchup_failed) {
++                dp.drafting = false;
++                continue;
++            }
++            if (!d.pending) {
++                continue;
++            }
++            const bool leads_in = dp.drafting && d.n_valid > 0 && d.pos[d.n_valid - 1] + 1 == dp.n_past;
++            if (!leads_in) {
++                if (!flush_deferred(seq_id)) {
++                    dp.drafting = false;
++                }
++            }
++        }
++
++        // Catch-up that leads into this draft rides in the same decode as the anchors. batch is
++        // allocated at exactly llama_n_batch(ctx_dft); a full stash (n_tokens == n_max+1 == n_batch)
++        // plus the anchor is a one-row heap overflow, and llama_decode enforces the same limit.
++        // Flush first when the combined count would not fit. Growing only the host allocation
++        // would still abort in decode.
++        {
++            const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
++            int32_t catchup_rows = 0;
++            int32_t n_anchors = 0;
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                auto & dp = dparams[seq_id];
++                auto & d = deferred[seq_id];
++                if (d.catchup_failed || !dp.drafting) {
++                    continue;
++                }
++                if (d.pending) {
++                    catchup_rows += d.n_valid;
++                }
++                n_anchors++;
++            }
++            if (!common_speculative_mtp_first_decode_fits(n_b, catchup_rows, n_anchors)) {
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (!dparams[seq_id].drafting || !deferred[seq_id].pending) {
++                        continue;
++                    }
++                    if (!flush_deferred(seq_id)) {
++                        dparams[seq_id].drafting = false;
++                    }
++                }
++            }
++        }
++
+         common_batch_clear(batch);
+ 
+         // keep track of which sequences are still drafting
+         int n_drafting = 0;
+         std::vector<bool> drafting(n_seq);
+-
+-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++        std::vector<char> catchup_in_batch(n_seq, 0);
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+@@ -2390,6 +2578,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             drafting[seq_id] = true;
+             common_sampler_reset(smpls[seq_id].get());
+ 
++            // catch-up rows ride in the same decode as the first draft row (no logits)
++            auto & d = deferred[seq_id];
++            if (d.pending) {
++                for (int32_t k = 0; k < d.n_valid; ++k) {
++                    common_batch_add(batch, d.tokens[k], d.pos[k], { seq_id }, false);
++                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, d.h.data() + (size_t) k * n_embd, row_bytes);
++                }
++                // Leave pending set until this decode succeeds. Clearing it here dropped the
++                // rows on a failed llama_decode: they were in neither the stash nor ctx_dft.
++                catchup_in_batch[seq_id] = 1;
++            }
++
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
+@@ -2422,8 +2622,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             int ret = llama_decode(ctx_dft, batch);
+             if (ret != 0) {
+                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
++                if (i == 0) {
++                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                        if (catchup_in_batch[seq_id]) {
++                            deferred[seq_id].catchup_failed = true;
++                        }
++                    }
++                }
+                 break;
+             }
++            if (i == 0) {
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (catchup_in_batch[seq_id]) {
++                        deferred[seq_id].pending = false;
++                    }
++                }
++            }
+ 
+             // rebuild the batch for the next step: the growing-KV paths re-add only the
+             // new token (the KV already holds the prefix), while chained heads re-add the
+@@ -2451,6 +2665,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 // add drafted token for each sequence
+                 const llama_token id = cur_p->data[0].id;
+ 
++                if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
++                    SPC_ERR("draft candidate id %d out of vocab (seq_id=%d, step=%d, i_last=%d, cur_p.size=%zu) - dropping draft\n",
++                            id, (int) seq_id, i, i_last[seq_id], (size_t) cur_p->size);
++                    drafting[seq_id] = false;
++                    n_drafting--;
++                    continue;
++                }
++
+                 // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+                     drafting[seq_id] = false;
+@@ -2466,7 +2688,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                // the caller's per-draft cap (the server's depth-dependent draft size) as well as the global one
++                if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -2532,6 +2755,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++
++        // only the accepted prefix of the verify batch needs to enter the draft's memory
++        auto & d = deferred[seq_id];
++        if (d.pending) {
++            d.n_valid = std::min<int32_t>(d.n_valid, i_h + 1);
++        }
+     }
+ };
+ 
+@@ -3212,8 +3441,26 @@ common_speculative_init_result::common_speculative_init_result(
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+     }
+ 
+-    // the draft context holds as many tokens per sequence as the target context
++    // the draft context holds as many tokens per sequence as the target context, unless the MTP draft only
++    // ever sees a bounded part of the sequence: the last --spec-draft-window rows (the server drops older ones
++    // before each batch), or rows up to --spec-draft-depth-max (never fed past it). Sizing it for that keeps
++    // its cache small; with the window its cells are reused and its attention span stays that short.
+     cparams.n_ctx = llama_n_ctx(ctx_tgt);
++    if (spec_mtp) {
++        const int32_t window    = params.speculative.draft.n_window;
++        const int32_t depth_max = params.speculative.draft.n_depth_max;
++        const int32_t span      = window > 0 ? window : depth_max;
++        if (span > 0) {
++            const uint32_t n_seq  = std::max<uint32_t>(1, cparams.n_seq_max);
++            const uint32_t need   = (uint32_t) span + 2*std::max<uint32_t>(cparams.n_batch, cparams.n_ubatch) + 256;
++            const uint32_t capped = GGML_PAD(need, 256) * n_seq;
++            if (capped < cparams.n_ctx) {
++                LOG_INF("%s: draft context sized to %u tokens (%s %d, target %u)\n", __func__, capped,
++                        window > 0 ? "spec-draft-window" : "spec-draft-depth-max", span, cparams.n_ctx);
++                cparams.n_ctx = capped;
++            }
++        }
++    }
+ 
+     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
+     cparams.ctx_other = ctx_tgt;
+@@ -3281,6 +3528,13 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
+     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+ }
+ 
++bool common_speculative_mtp_first_decode_fits(int32_t n_batch, int32_t catchup_rows, int32_t n_anchors) {
++    if (n_batch <= 0 || catchup_rows < 0 || n_anchors < 0) {
++        return false;
++    }
++    return (int64_t) catchup_rows + (int64_t) n_anchors <= (int64_t) n_batch;
++}
++
+ common_speculative_output_limits common_speculative_get_output_limits(
+         int32_t n_batch, int32_t n_parallel, int32_t n_draft) {
+     const int64_t per_seq = 1 + (int64_t) std::max(0, n_draft);
+@@ -3508,10 +3762,15 @@ void common_speculative_draft(common_speculative * spec) {
+             if (dp.drafting && !result.empty()) {
+                 dp.drafting = false;
+ 
+-                if (dp.n_max > 0) {
+-                    if (!result.empty() && (int) result.size() > dp.n_max) {
+-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
+-                        result.resize(dp.n_max);
++                const auto t = impl.get()->type;
++                const bool lookup = t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
++                                    t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
++                                    t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
++                const int32_t cap = lookup && dp.n_max_lookup > 0 ? dp.n_max_lookup : dp.n_max;
++                if (cap > 0) {
++                    if (!result.empty() && (int) result.size() > cap) {
++                        SPC_DBG("truncating draft to %d tokens\n", cap);
++                        result.resize(cap);
+                     }
+                 }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index a7a4775..083347b 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -37,6 +37,10 @@ struct common_speculative_output_limits {
+ common_speculative_output_limits common_speculative_get_output_limits(
+         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+ 
++// True if deferred catch-up rows plus one first-draft anchor per sequence fit in one llama_decode.
++// Used by draft-mtp so a full-prefill stash (n_tokens == n_batch) does not add a 33rd row.
++bool common_speculative_mtp_first_decode_fits(int32_t n_batch, int32_t catchup_rows, int32_t n_anchors);
++
+ common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
+ 
+ void common_speculative_free(common_speculative * spec);
+@@ -60,6 +64,9 @@ struct common_speculative_draft_params {
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++
++    // limit for the lookup drafters (ngram-*); 0 = n_max
++    int32_t n_max_lookup = 0;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f4fa37d..1903ce8 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -958,6 +958,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_add_id_f32;
+ 
+     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
++    vk_pipeline pipeline_concat_transpose_32;
+     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
+     vk_pipeline pipeline_scale_f32;
+     vk_pipeline pipeline_log[2];
+@@ -1053,6 +1054,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
+     vk_pipeline pipeline_sum_rows_f32;
+     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
++    vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
+     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+     // rows a workgroup covers, chosen per width when the pipeline is built
+     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
+@@ -1415,6 +1417,8 @@ struct vk_op_fwht_push_constants {
+     uint32_t src_offset;
+     uint32_t dst_offset;
+     float scale;
++    uint32_t n_blk;     // signed variant only
++    uint32_t s_offset;  // signed variant only
+ };
+ 
+ struct vk_op_count_experts_push_constants {
+@@ -2405,6 +2409,7 @@ struct ggml_backend_vk_context {
+     int fused_ops_write_mask {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
++    bool fused_mul_fwht {};
+ 
+     // for GGML_VK_PERF_LOGGER
+     std::unique_ptr<vk_perf_logger> perf_logger;
+@@ -3794,6 +3799,23 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device,
+         }
+     }
+ 
++    // Tuning hook for batched (prefill) FA: GGML_VK_FA_SCALAR = block_rows,block_cols,row_split,workgroup_size,d_split.
++    // Decode (n_rows <= 8) is never affected; a set that fails the shared-memory check is ignored.
++    // ⚠ With subgroups, row_split > 1 requires workgroup_size / row_split == subgroup_size: the row max/sum are
++    // reduced with subgroup shuffles only. Other combinations run and look plausible but compute wrong attention
++    // (row_split 2 at 128 threads on a 32-wide subgroup "sped up" deep prefill 5.5% by skipping half of each reduction).
++    if (n_rows > 8) {
++        const char * fa_env = getenv("GGML_VK_FA_SCALAR");
++        unsigned br, bc, rs, wg, ds;
++        if (fa_env && sscanf(fa_env, "%u,%u,%u,%u,%u", &br, &bc, &rs, &wg, &ds) == 5) {
++            vk_fa_tuning_params t = result;
++            t.block_rows = br; t.block_cols = bc; t.row_split = rs; t.workgroup_size = wg; t.d_split = ds;
++            if (ggml_vk_flash_attn_scalar_shmem_support(device, t, hsk, hsv, f32acc, k_type, v_type)) {
++                result = t;
++            }
++        }
++    }
++
+     return result;
+ }
+ 
+@@ -4025,7 +4047,9 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
+ 
+     uint32_t block_a_size = 0;
+     switch (src0_type) {
+-        case GGML_TYPE_Q2_0:    block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
++        case GGML_TYPE_Q2_0:
++        case GGML_TYPE_PQ2_0:   block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm (same block_a_cache as Q2_0)
++        case GGML_TYPE_PTQ1_0:  block_a_size = std430_size({{ 8, 4}, {fp_size,  fp_align}});                  break; // packed 2-bit qs[2] + dm
+         case GGML_TYPE_Q4_0:    block_a_size = std430_size({{16, 4}, {fp_size,  fp_align}});                  break; // qs[16/4] + dm
+         case GGML_TYPE_Q4_1:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[16/4] + dm(vec2)
+         case GGML_TYPE_Q5_0:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp_size,  fp_align}});          break; // qs[16/4] + qh + dm
+@@ -4315,6 +4339,35 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+         }
+ 
++        // Tuning hook: GGML_VK_MMQ_INT_L / GGML_VK_MMQ_INT_M = 11 comma-separated warptile values
++        // (BLOCK_SIZE,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP) for the integer MMQ tiles. BM/BN must stay at the
++        // tier's size (128/128 and 64/64) because the workgroup denominators below are shared with float MM.
++        auto warptile_env = [](const char * name, std::vector<uint32_t> & wt, uint32_t bm, uint32_t bn) {
++            const char * v = getenv(name);
++            if (!v) {
++                return;
++            }
++            std::vector<uint32_t> vals;
++            std::string str(v);
++            size_t pos = 0;
++            while (pos <= str.size()) {
++                const size_t next = str.find(',', pos);
++                vals.push_back((uint32_t) std::stoul(str.substr(pos, next == std::string::npos ? std::string::npos : next - pos)));
++                if (next == std::string::npos) {
++                    break;
++                }
++                pos = next + 1;
++            }
++            if (vals.size() != 11 || vals[1] != bm || vals[2] != bn) {
++                GGML_LOG_WARN("%s: ignoring %s (need 11 values with BM=%u BN=%u)\n", __func__, name, bm, bn);
++                return;
++            }
++            wt = vals;
++            GGML_LOG_INFO("%s: %s = %s\n", __func__, name, v);
++        };
++        warptile_env("GGML_VK_MMQ_INT_L", l_warptile_mmq_int, 128, 128);
++        warptile_env("GGML_VK_MMQ_INT_M", m_warptile_mmq_int, 64, 64);
++
+         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
+         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
+         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+@@ -4932,6 +4985,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+             CREATE_MMQ(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_0], matmul_q2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MMQ(GGML_TYPE_PQ2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PQ2_0], matmul_pq2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MMQ(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PTQ1_0], matmul_ptq1_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0], matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1], matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0], matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+@@ -5115,6 +5170,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+             CREATE_MMQ(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_0].f32acc, matmul_q2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
++            CREATE_MMQ(GGML_TYPE_PQ2_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PQ2_0].f32acc, matmul_pq2_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
++            CREATE_MMQ(GGML_TYPE_PTQ1_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_PTQ1_0].f32acc, matmul_ptq1_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0].f32acc, matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1].f32acc, matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+@@ -5662,6 +5719,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_32, "concat_transpose_32", concat_transpose_32_len, concat_transpose_32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
+@@ -5819,6 +5877,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             if (use_subgroup && !wide) {
+                 if (device->subgroup_size <= n) {
+                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
++                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                     // the f16 shader needs shader-float16; a null pipeline makes ggml_vk_can_use_fwht fall back
+                     if (device->fp16) {
+                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+@@ -5832,6 +5891,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 if ((uint64_t)rows * n * sizeof(float) <= device->properties.limits.maxComputeSharedMemorySize &&
+                     block_size * rows <= device->properties.limits.maxComputeWorkGroupInvocations) {
+                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_shmem_signed_f32", fwht_shmem_signed_f32_len, fwht_shmem_signed_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
+                     if (device->fp16) {
+                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_shmem_f16", fwht_shmem_f16_len, fwht_shmem_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
+                     }
+@@ -10109,6 +10169,36 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+ }
+ 
++// Fused MUL(x, signs) -> RESHAPE -> MUL_MAT(hadamard, .): one FWHT pass that applies the sign flip on load.
++// dst is the MUL_MAT output; the transform width is the reshape's ne[0].
++static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, const ggml_tensor * signs, ggml_tensor * dst) {
++    const int64_t n = dst->src[1]->ne[0];
++    const int idx = ggml_vk_fwht_pipeline_idx(n);
++    vk_pipeline pipeline = ctx->device->pipeline_fwht_signed_f32[idx];
++
++    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
++    GGML_ASSERT(rows_per_workgroup > 0);
++    const uint32_t n_rows = (uint32_t)(ggml_nelements(src) / n);
++    const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
++    const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), max_workgroups_x);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src, true);
++    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
++    const vk_subbuffer s_buf   = ggml_vk_tensor_subbuffer(ctx, signs, true);
++
++    vk_op_fwht_push_constants pc = {
++        n_rows,
++        (uint32_t)(get_misalign_bytes(ctx, src)   / ggml_type_size(src->type)),
++        (uint32_t)(get_misalign_bytes(ctx, dst)   / ggml_type_size(dst->type)),
++        1.0f / std::sqrt((float)n),
++        (uint32_t)(src->ne[0] / n),
++        (uint32_t)(get_misalign_bytes(ctx, signs) / ggml_type_size(signs->type)),
++    };
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, s_buf }, pc, { workgroups_x, 1, 1 });
++}
++
+ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+     ggml_tensor * dst = cgraph->nodes[node_idx];
+     ggml_tensor * src0 = dst->src[0];
+@@ -11356,6 +11446,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         if (!ggml_vk_concat_supported(src0, src1, dst)) {
+             return nullptr;
+         }
++        if (ggml_get_op_params_i32(dst, 0) == 0 && !ggml_is_quantized(dst->type) &&
++            ggml_type_size(src0->type) == 4 && ggml_type_size(src1->type) == 4 && ggml_type_size(dst->type) == 4 &&
++            src1->nb[1] == 4 && src1->nb[0] > src1->nb[1] && dst->nb[0] == 4) {
++            // transposed src1: tiled shader keeps src1 reads and dst writes contiguous
++            return ctx->device->pipeline_concat_transpose_32;
++        }
+         switch (ggml_vk_concat_unit_size(src0->type)) {
+         case 1:
+             return ctx->device->pipeline_concat_i8;
+@@ -12399,6 +12495,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+                 elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+                 elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                 elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
++            } else if (pipeline == ctx->device->pipeline_concat_transpose_32) {
++                // 32x32 tiles over dst dims 0 and 1; dims 2 and 3 are the batch
++                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
++                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 32);
++                elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);
++                elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
++                elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
++                elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+             } else if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
+                 pipeline == ctx->device->pipeline_cpy_transpose_16) {
+                 // 32x32 tiles
+@@ -15571,7 +15675,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_MUL:
+-        if (ctx->num_additional_fused_ops) {
++        if (ctx->fused_mul_fwht) {
++            ggml_vk_fwht_signed(ctx, compute_ctx, src0, src1, cgraph->nodes[node_idx + 2]);
++        } else if (ctx->num_additional_fused_ops) {
+             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+         } else {
+             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
+@@ -16781,6 +16887,48 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+ }
+ 
+ // Match SSM_CONV + UNARY(SILU) or SSM_CONV + ADD + UNARY(SILU). num_extra is 1 or 2.
++// MUL(x, signs) -> RESHAPE -> MUL_MAT(hadamard hint): the prism Hadamard input rotation. ggml_can_fuse needs
++// equal shapes, which a reshape breaks, so the chain is checked by identity and use count instead.
++static bool ggml_vk_can_fuse_mul_fwht(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
++    if (node_idx + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * mul = cgraph->nodes[node_idx];
++    const ggml_tensor * rs  = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * mm  = cgraph->nodes[node_idx + 2];
++    if (mul->op != GGML_OP_MUL || rs->op != GGML_OP_RESHAPE || mm->op != GGML_OP_MUL_MAT) {
++        return false;
++    }
++    if (rs->src[0] != mul || mm->src[1] != rs || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
++        return false;
++    }
++    if (!ggml_node_has_n_uses(cgraph, node_idx, 1) || ggml_node_get_use_count(cgraph, node_idx + 1) != 1 ||
++        (rs->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * sg = mul->src[1];
++    // Prefill-sized batches only: at decode sizes the sign MUL is a ~2 us op that the reorder pass overlaps with
++    // other work, and tying it to the FWHT measured slower (tg -0.8%) while prefill gains (+1.7%).
++    if (ggml_nrows(x) <= 8) {
++        return false;
++    }
++    if (x->type != GGML_TYPE_F32 || sg->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
++        mm->src[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(sg) || !ggml_is_contiguous(rs) || !ggml_is_contiguous(mm) ||
++        !ggml_are_same_shape(x, mul) || sg->ne[0] != x->ne[0] || ggml_nelements(sg) != x->ne[0]) {
++        return false;
++    }
++    const int64_t n = rs->ne[0];
++    if (n <= 0 || x->ne[0] % n != 0 || mm->src[0]->ne[0] != n || mm->src[0]->ne[1] != n) {
++        return false;
++    }
++    const int idx = ggml_vk_fwht_pipeline_idx(n);
++    return idx >= 0 && ctx->device->pipeline_fwht_signed_f32[idx] != nullptr && ctx->device->fwht_rows_per_wg[idx] > 0;
++}
++
+ static bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                       int node_idx, int num_extra) {
+     const ggml_tensor * conv = cgraph->nodes[node_idx];
+@@ -17326,6 +17474,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
++        ctx->fused_mul_fwht = false;
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+@@ -17333,6 +17482,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->num_additional_fused_ops = num_adds - 1;
+                 fusion_string = "MULTI_ADD";
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
++            } else if (ggml_vk_can_fuse_mul_fwht(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 2;
++                ctx->fused_mul_fwht = true;
++                fusion_string = "MUL_FWHT";
++                op_srcs_fused_elementwise[0] = false;
++                op_srcs_fused_elementwise[1] = false;
++                op_srcs_fused_elementwise[2] = false;
+             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+                 ctx->num_additional_fused_ops = 2;
+                 fusion_string = "MUL_MAT_ADD_ADD";
+@@ -17531,6 +17687,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_ops_write_mask = 1;
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                 ctx->fused_topk_moe_scale = false;
++                ctx->fused_mul_fwht = false;
+             }
+         }
+ 
+@@ -17696,6 +17853,21 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+             return false;
+         };
+ 
++        // MUL(signs) -> RESHAPE -> MUL_MAT(hadamard) is fused into one signed FWHT (MUL_FWHT); keep the three
++        // consecutive inside the current set instead of letting the view pass split them
++        auto const &pull_mul_fwht = [&](int m) {
++            if (m + 2 < graph->n_nodes && !used[m + 1] && !used[m + 2] &&
++                graph->nodes[m]->op == GGML_OP_MUL && graph->nodes[m]->src[0] && ggml_nrows(graph->nodes[m]->src[0]) > 8 &&
++                graph->nodes[m + 1]->op == GGML_OP_RESHAPE && graph->nodes[m + 1]->src[0] == graph->nodes[m] &&
++                graph->nodes[m + 2]->op == GGML_OP_MUL_MAT && graph->nodes[m + 2]->src[1] == graph->nodes[m + 1] &&
++                ggml_get_op_params_i32(graph->nodes[m + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
++                current_set.push_back(m + 1);
++                current_set.push_back(m + 2);
++                used[m + 1] = true;
++                used[m + 2] = true;
++            }
++        };
++
+         if (keep_pattern(topk_moe_early_softmax_norm)) {
+             continue;
+         }
+@@ -17717,6 +17889,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+ 
+         // First, grab the next unused node.
+         current_set.push_back(first_unused);
++        pull_mul_fwht(first_unused);
+ 
+         // Loop through the next N nodes. Grab any that don't depend on other nodes that
+         // haven't already been run. Nodes that have already been run have used[i] set
+@@ -17758,6 +17931,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+             }
+             if (ok) {
+                 current_set.push_back(j);
++                pull_mul_fwht(j);
+ 
+                 int rope_idx = j;
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp b/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp
+new file mode 100644
+index 0000000..21cb5bf
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp
+@@ -0,0 +1,65 @@
++#version 450
++
++#include "types.glsl"
++#include "generic_binary_head.glsl"
++
++// CONCAT along dim 0 where src1 is transposed (its dim 1 is the innermost dimension), e.g. the delta-net
++// conv input concat(conv_states, transpose(qkv)). The plain concat shader reads src1 with a stride of a whole
++// row per thread; here a workgroup moves a 32x32 tile through shared memory so both the src1 reads (along
++// dim 1) and the dst writes (along dim 0) are contiguous. Same layout as copy_transpose.comp.
++#define TILE_DIM 32
++layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
++
++shared uint sh[TILE_DIM][TILE_DIM + 1];
++
++void iter(uvec3 wg_id) {
++    const uint tile_col = wg_id.x;     // dst dim 0 (src0 part, then src1 part)
++    const uint tile_row = wg_id.y;     // dst dim 1
++    const uint tid_col = gl_LocalInvocationID.x;
++    const uint tid_row = gl_LocalInvocationID.y;
++    const uint i2 = wg_id.z % p.ne22;
++    const uint i3 = wg_id.z / p.ne22;
++
++    // load: tid.x runs along dim 1 (contiguous in src1)
++    [[unroll]] for (uint y = 0; y < 4; ++y) {
++        const uint i0 = tile_col * TILE_DIM + tid_row + 8 * y;
++        const uint i1 = tile_row * TILE_DIM + tid_col;
++        if (i0 < p.ne20 && i1 < p.ne21) {
++            uint v;
++            if (i0 < p.ne00) {
++                v = uint(data_a[get_aoffset() + i0 * p.nb00 + i1 * p.nb01 + i2 * p.nb02 + i3 * p.nb03]);
++            } else {
++                v = uint(data_b[get_boffset() + (i0 - p.ne00) * p.nb10 + i1 * p.nb11 + i2 * p.nb12 + i3 * p.nb13]);
++            }
++            sh[tid_row + 8 * y][tid_col] = v;
++        }
++    }
++
++    barrier();
++
++    // store: tid.x runs along dim 0 (contiguous in dst)
++    [[unroll]] for (uint y = 0; y < 4; ++y) {
++        const uint i0 = tile_col * TILE_DIM + tid_col;
++        const uint i1 = tile_row * TILE_DIM + tid_row + 8 * y;
++        if (i0 < p.ne20 && i1 < p.ne21) {
++            data_d[get_doffset() + i0 * p.nb20 + i1 * p.nb21 + i2 * p.nb22 + i3 * p.nb23] = D_TYPE(sh[tid_col][tid_row + 8 * y]);
++        }
++    }
++}
++
++#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
++
++void main() {
++    bool need_barrier = false;
++    for (uint z = gl_WorkGroupID.z; z < p.ne22 * p.ne23; z += gl_NumWorkGroups.z) {
++        for (uint y = gl_WorkGroupID.y; y < CEIL_DIV(p.ne21, TILE_DIM); y += gl_NumWorkGroups.y) {
++            for (uint x = gl_WorkGroupID.x; x < CEIL_DIV(p.ne20, TILE_DIM); x += gl_NumWorkGroups.x) {
++                if (need_barrier) {
++                    barrier();
++                }
++                need_barrier = true;
++                iter(uvec3(x, y, z));
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+index 904c898..342e8b0 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+@@ -21,6 +21,8 @@ layout(push_constant) uniform parameter
+     uint src_offset;
+     uint dst_offset;
+     float scale;
++    uint n_blk;     // FWHT_SIGNED: sign blocks of N per activation row (row r uses block r % n_blk)
++    uint s_offset;  // FWHT_SIGNED: element offset of the sign vector
+ };
+ 
+ layout(binding = 0, std430) readonly buffer A {
+@@ -31,6 +33,10 @@ layout(binding = 0, std430) readonly buffer A {
+ #endif
+ };
+ layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
++#ifdef FWHT_SIGNED
++// fused MUL(x, signs) -> FWHT: the Hadamard sign flip is applied while loading
++layout(binding = 2, std430) readonly buffer S { float data_s[]; };
++#endif
+ 
+ const uint EL_W = N / BLOCK_SIZE;
+ 
+@@ -64,7 +70,11 @@ void main() {
+ 
+         [[unroll]]
+         for (uint i = 0; i < EL_W; ++i) {
+-            reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;
++            float v = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) : 0.0;
++#ifdef FWHT_SIGNED
++            v *= data_s[s_offset + (row % n_blk) * N + i * BLOCK_SIZE + tid];
++#endif
++            reg[i] = v * scale;
+         }
+ 
+ #ifdef FWHT_SHMEM
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+index 1f60af3..e6b3906 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+@@ -159,14 +159,36 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint grp = idx & 0xfu;      // which 8-element group inside the block
+             const uint e0  = grp * 8u;
+ 
+-            const float d = float(data_a[ib].d);
++            // One word carries qh[0], qh[1] and d. The 8 elements of a group 0..14 are 8 consecutive
++            // qs bytes at one shared trit index n (see ptq1_0.glsl for the element order), so two
++            // aligned word loads + ptq1_0_trits4 decode them with no per-element branch or loop.
++            const uint qhd = data_a_packed32[ib].qh_d;
++            const float d = unpackHalf2x16(qhd).y;
++            uint p0, p1;
++            if (grp < 15u) {
++                const uint w = grp < 10u ? (grp & 1u) * 2u : 4u;       // first qs word of the group
++                const uint n = grp < 10u ? grp >> 1u : grp - 10u;       // shared trit index, 0..4
++                const uint m = n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u;
++                p0 = ptq1_0_trits4(data_a_packed32[ib].qs[w],      m);
++                p1 = ptq1_0_trits4(data_a_packed32[ib].qs[w + 1u], m);
++            } else {
++                // elements 120..127 alternate qh[0], qh[1] at trits 0,0,1,1,2,2,3,3
++                const uint q = (qhd & 0xFFu) | ((qhd & 0xFF00u) << 8u);    // lanes (qh0, qh1)
++                const uint t0 = ((((q      ) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++                const uint t1 = ((((q *  3u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++                const uint t2 = ((((q *  9u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++                const uint t3 = ((((q * 27u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++                p0 = (t0 & 3u) | ((t0 >> 16u) << 8u) | ((t1 & 3u) << 16u) | ((t1 >> 16u) << 24u);
++                p1 = (t2 & 3u) | ((t2 >> 16u) << 8u) | ((t3 & 3u) << 16u) | ((t3 >> 16u) << 24u);
++            }
++            const vec4 f0 = (vec4(unpack8(p0)) - 1.0f) * d;
++            const vec4 f1 = (vec4(unpack8(p1)) - 1.0f) * d;
+ 
+             const uint k_pair = row * LOAD_VEC_A / 2;
+-            [[unroll]] for (uint l = 0; l < 4; ++l) {
+-                store_a(col, k_pair + l, FLOAT_TYPEV2(
+-                    ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
+-                    ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+-            }
++            store_a(col, k_pair,     FLOAT_TYPEV2(f0.xy));
++            store_a(col, k_pair + 1, FLOAT_TYPEV2(f0.zw));
++            store_a(col, k_pair + 2, FLOAT_TYPEV2(f1.xy));
++            store_a(col, k_pair + 3, FLOAT_TYPEV2(f1.zw));
+ #elif defined(DATA_A_Q1_0)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+index 24da4f7..4aac3c7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+@@ -6,7 +6,24 @@
+ 
+ // Each iqs value maps to a 32-bit integer
+ 
+-#if defined(DATA_A_Q2_0)
++#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
++#if defined(DATA_A_PQ2_0)
++// PQ2_0 = Q2_0's 2-bit codec at group 128. A load thread (iqs 0..3) takes 8 elements = one 16-bit word of qs:
++// byte b carries elements 4b..4b+3 in bits 0-1, 2-3, 4-5, 6-7; each field moves into its own byte lane.
++uint pq2_0_spread(const uint b) {
++    return (b & 3u) | ((b & 0xCu) << 6u) | ((b & 0x30u) << 12u) | ((b & 0xC0u) << 18u);
++}
++void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
++    const uint block_idx = ib / 4;
++    const uint v = uint(data_a_packed16[block_idx].qs[(ib & 3u) * 4u + iqs]);
++    buf_a[buf_ib].qs[iqs * 2u]      = int32_t(pq2_0_spread(v & 0xFFu));
++    buf_a[buf_ib].qs[iqs * 2u + 1u] = int32_t(pq2_0_spread(v >> 8u));
++
++    if (iqs == 0) {
++        buf_a[buf_ib].dm = FLOAT_TYPE(data_a_packed16[block_idx].d);
++    }
++}
++#else
+ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+     const uint block_idx = ib / 2;
+     const uint byte_idx = (ib & 1u) * 8u + iqs;
+@@ -21,6 +38,7 @@ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+         buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+     }
+ }
++#endif
+ 
+ void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+     cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+@@ -40,6 +58,74 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
+ }
+ #endif
+ 
++
++#if defined(DATA_A_PTQ1_0)
++#include "ptq1_0.glsl"
++uint ptq1_0_m(const uint n) { return n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u; }
++
++// A load thread (iqs 0..1) packs 16 elements, g = 2 * (ib & 3) + iqs covers elements 16g..16g+15:
++//   g 0..4 : qs[0..15] (4 words) at trit g
++//   g 5, 6 : qs[16..23] (words 4, 5) at trits 2(g-5) and 2(g-5)+1, eight elements each
++//   g 7    : qs[16..23] at trit 4, then qh[0], qh[1] alternating (elements 120..127)
++// p0..p3 hold four codes each, one per byte; OR-ing them at shifts 0, 2, 4, 6 is the bit transpose.
++void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
++    const uint block_idx = ib / 4;
++    const uint g = (ib & 3u) * 2u + iqs;
++    uint p0, p1, p2, p3;
++    if (g < 5u) {
++        const uint m = ptq1_0_m(g);
++        p0 = ptq1_0_trits4(data_a_packed32[block_idx].qs[0], m);
++        p1 = ptq1_0_trits4(data_a_packed32[block_idx].qs[1], m);
++        p2 = ptq1_0_trits4(data_a_packed32[block_idx].qs[2], m);
++        p3 = ptq1_0_trits4(data_a_packed32[block_idx].qs[3], m);
++    } else {
++        const uint w4 = data_a_packed32[block_idx].qs[4];
++        const uint w5 = data_a_packed32[block_idx].qs[5];
++        const uint na = 2u * (g - 5u);
++        const uint ma = ptq1_0_m(na);
++        p0 = ptq1_0_trits4(w4, ma);
++        p1 = ptq1_0_trits4(w5, ma);
++        if (g < 7u) {
++            const uint mb = ptq1_0_m(na + 1u);
++            p2 = ptq1_0_trits4(w4, mb);
++            p3 = ptq1_0_trits4(w5, mb);
++        } else {
++            const uint qhd = data_a_packed32[block_idx].qh_d;
++            const uint q = (qhd & 0xFFu) | ((qhd & 0xFF00u) << 8u);    // 16-bit lanes (qh0, qh1)
++            const uint t0 = ((((q      ) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++            const uint t1 = ((((q *  3u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++            const uint t2 = ((((q *  9u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++            const uint t3 = ((((q * 27u) & 0x00FF00FFu) * 3u) >> 8u) & 0x00030003u;
++            p2 = (t0 & 3u) | ((t0 >> 16u) << 8u) | ((t1 & 3u) << 16u) | ((t1 >> 16u) << 24u);
++            p3 = (t2 & 3u) | ((t2 >> 16u) << 8u) | ((t3 & 3u) << 16u) | ((t3 >> 16u) << 24u);
++        }
++    }
++    buf_a[buf_ib].qs[iqs] = p0 | (p1 << 2u) | (p2 << 4u) | (p3 << 6u);
++
++    if (iqs == 0) {
++        buf_a[buf_ib].dm = FLOAT_TYPE(unpackHalf2x16(data_a_packed32[block_idx].qh_d).y);
++    }
++}
++
++void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
++    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
++    cache_a[reg_ib].qs[0] = buf_a[buf_ib].qs[0];
++    cache_a[reg_ib].qs[1] = buf_a[buf_ib].qs[1];
++}
++
++ACC_TYPE mmq_dot_product(const uint ib_a) {
++    int32_t q_sum = 0;
++    [[unroll]] for (uint w = 0; w < 2; ++w) {
++        const uint v = cache_a[ib_a].qs[w];
++        [[unroll]] for (uint k = 0; k < 4; ++k) {
++            q_sum += dotPacked4x8EXT(int32_t((v >> (2u * k)) & 0x03030303u), cache_b.qs[w * 4u + k]);
++        }
++    }
++    // stored codes are w + 1: subtract sum(y) through q8_1's precomputed block sum
++    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
++}
++#endif
++
+ #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+ // 2-byte loads for Q4_0 blocks (18 bytes)
+ // 4-byte loads for Q4_1 blocks (20 bytes)
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+index 2b7adcb..4dd4631 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+@@ -19,6 +19,22 @@ struct block_a_cache {
+     int32_t qs[8];
+     FLOAT_TYPE dm;
+ };
++#elif defined(DATA_A_PQ2_0)
++// Q2_0's cache (8 words of int8 per 32 elements), but each load thread fills two words (8 elements)
++#define QUANT_R_MMQ 2
++struct block_a_cache {
++    int32_t qs[8];
++    FLOAT_TYPE dm;
++};
++#elif defined(DATA_A_PTQ1_0)
++// 2-bit codes (weight + 1, 0..2), bit-transposed: word w covers elements 16w..16w+15 and byte j of it holds
++// elements 16w + 4k + j at bits 2k..2k+1, so (qs[w] >> 2k) & 0x03030303 is elements 16w+4k .. 16w+4k+3 as int8.
++// Each load thread fills one word (16 elements).
++#define QUANT_R_MMQ 4
++struct block_a_cache {
++    uint32_t qs[2];
++    FLOAT_TYPE dm;
++};
+ #elif defined(DATA_A_Q4_1)
+ #define QUANT_R_MMQ 2
+ struct block_a_cache {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ptq1_0.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/ptq1_0.glsl
+index 7eedd83..e96d283 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/ptq1_0.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/ptq1_0.glsl
+@@ -35,4 +35,16 @@ float ptq1_0_trit(uint ib, uint a_offset, uint e) {
+     return float(int((v * 3u) >> 8u) - 1);
+ }
+ 
++// Trit n of each of the four bytes of w, returned one per byte lane (values 0..2).
++// m = 3^n mod 256. The bytes are split into two 16-bit-lane words (b0,b2) and (b1,b3):
++// a lane holds at most 255 * 81 = 20655 after the multiply and 255 * 3 = 765 after the
++// second one, so lanes never carry into each other and one 32-bit multiply does two bytes.
++uint ptq1_0_trits4(const uint w, const uint m) {
++    const uint lo = ((w & 0x00FF00FFu) * m) & 0x00FF00FFu;
++    const uint hi = (((w >> 8u) & 0x00FF00FFu) * m) & 0x00FF00FFu;
++    const uint tlo = ((lo * 3u) >> 8u) & 0x00030003u;   // trits of b0 (bits 0-1) and b2 (bits 16-17)
++    const uint thi = ((hi * 3u) >> 8u) & 0x00030003u;   // trits of b1 and b3
++    return tlo | (thi << 8u);
++}
++
+ #endif // PTQ1_0_GLSL
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index f50742c..6950e7c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -225,11 +225,20 @@ struct block_ptq1_0
+     float16_t d;
+ };
+ 
++// Same 28 bytes as seven words: qs as 6 words, then qh[0] | qh[1] << 8 | d << 16.
++// 28 is a multiple of 4, so every block starts word-aligned.
++struct block_ptq1_0_packed32
++{
++    uint32_t qs[6];
++    uint32_t qh_d;
++};
++
+ #if defined(DATA_A_PTQ1_0)
+ #define QUANT_K QUANT_K_PTQ1_0
+ #define QUANT_R QUANT_R_PTQ1_0
+ #define QUANT_AUXF 1
+ #define A_TYPE block_ptq1_0
++#define A_TYPE_PACKED32 block_ptq1_0_packed32
+ #endif
+ 
+ // PQ2_0: Prism Q2_0 at group 128 (same 2-bit codec, one fp16 scale per 128).
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index f223918..3a189f1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -629,7 +629,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+ 
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         // Integer dot mmq performs better with f32 accumulators (different shader, skip for dot2)
+-        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
++        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4" || tname == "pq2_0" || tname == "ptq1_0")) {
+             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+         }
+ #endif
+@@ -910,6 +910,7 @@ void process_shaders() {
+     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
++    string_to_spv("concat_transpose_32", "concat_transpose.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+ 
+     string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+ 
+@@ -1041,6 +1042,8 @@ void process_shaders() {
+     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+     string_to_spv("fwht_f16", "fwht.comp", {{"FWHT_F16", "1"}});
+     string_to_spv("fwht_shmem_f16", "fwht.comp", {{"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
++    string_to_spv("fwht_signed_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}});
++    string_to_spv("fwht_shmem_signed_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_SIGNED", "1"}});
+     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+index c685346..aa50647 100644
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -1335,15 +1335,32 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
+     };
+ 
+     // redirect elements in stacks to point to new rules
++    // (each stack element is found by a binary search over the rules' start addresses: the search over every element
++    // of every rule cost O(stack elements x grammar size) per clone, and the server clones the sampler on every
++    // speculative step - with a grammar for 100 tool schemas that was about 10 ms per step)
++    std::vector<std::pair<const llama_grammar_element *, size_t>> starts;
++    starts.reserve(grammar.rules.size());
++    for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
++        if (!grammar.rules[ir0].empty()) {
++            starts.emplace_back(grammar.rules[ir0].data(), ir0);
++        }
++    }
++    std::sort(starts.begin(), starts.end(), [](const auto & a, const auto & b) { return std::less<const llama_grammar_element *>()(a.first, b.first); });
+     for (size_t is = 0; is < result->stacks.size(); is++) {
+         for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
+-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
+-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
+-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
+-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
+-                    }
+-                }
++            const llama_grammar_element * pe = grammar.stacks[is][ie];
++            auto it = std::upper_bound(starts.begin(), starts.end(), pe,
++                [](const llama_grammar_element * v, const auto & e) { return std::less<const llama_grammar_element *>()(v, e.first); });
++            if (it == starts.begin()) {
++                continue;
++            }
++            --it;
++            const size_t ir0 = it->second;
++            const auto & rule = grammar.rules[ir0];
++            if (!std::less<const llama_grammar_element *>()(pe, rule.data() + rule.size())) {
++                continue;
+             }
++            result->stacks[is][ie] = &result->rules[ir0][(size_t) (pe - rule.data())];
+         }
+     }
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 2f143d3..1fb752e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -755,9 +755,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+-    res->t_h_nextn = cur;
+ 
+-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    // llama_context copies the first n_outputs rows of t_h_nextn when embeddings_nextn_masked is set,
++    // so publish the output rows only (as the trunk graph does); unmasked readers index by token.
++    // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
++    // together with the first draft row.
++    if (cparams.embeddings_nextn_masked) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        res->t_h_nextn = cur;
++    } else {
++        res->t_h_nextn = cur;
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f1f1179..89c1b8c 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -305,6 +305,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+ 
+ llama_build_and_test(test-arg-parser.cpp)
++llama_build_and_test(test-mtp-catchup-batch.cpp)
+ llama_build_and_test(test-model-resolution.cpp)
+ # the test serves its repos from an httplib server, and the library links it privately
+ target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 72e580d..df0d46f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6084,6 +6084,29 @@ struct test_conv_3d : public test_case {
+ };
+ 
+ // GGML_OP_CONCAT
++// GGML_OP_CONCAT along dim 0 with a transposed src1 (dim 1 innermost): the delta-net conv input
++// concat(conv_states, transpose(qkv)); Vulkan runs it through concat_transpose
++struct test_concat_transposed : public test_case {
++    const int64_t n_state, n_chan, n_tok, n_seq;
++
++    std::string vars() override {
++        return VARS_TO_STR4(n_state, n_chan, n_tok, n_seq);
++    }
++
++    test_concat_transposed(int64_t n_state = 3, int64_t n_chan = 70, int64_t n_tok = 45, int64_t n_seq = 1)
++        : n_state(n_state), n_chan(n_chan), n_tok(n_tok), n_seq(n_seq) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_state, n_chan, n_seq);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_chan, n_tok, n_seq);
++        ggml_set_name(b, "b");
++        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, b), 0);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ struct test_concat : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+@@ -9839,6 +9862,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    for (int64_t n_seq : {1, 2}) {
++        test_cases.emplace_back(new test_concat_transposed(3, 70, 45, n_seq));    // partial tiles on both dims
++        test_cases.emplace_back(new test_concat_transposed(3, 128, 64, n_seq));   // whole tiles
++        test_cases.emplace_back(new test_concat_transposed(3, 1000, 257, n_seq));
++    }
+ 
+     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
+         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
+@@ -10320,6 +10348,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    test_cases.emplace_back(new test_concat_transposed(3, 10240, 1024, 1));
+     // bandwidth comparison at Bonsai-2 shapes
+     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
+         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));
+@@ -10571,6 +10601,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    // Bonsai 2 / Qwen3.8-27B attention layer during a 1k-token prefill at 16k depth (24 q heads, 4 kv heads)
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
+diff --git a/tests/test-mtp-catchup-batch.cpp b/tests/test-mtp-catchup-batch.cpp
+new file mode 100644
+index 0000000..5de04e8
+--- /dev/null
++++ b/tests/test-mtp-catchup-batch.cpp
+@@ -0,0 +1,23 @@
++// Host-only bounds for draft-mtp's first decode: deferred catch-up plus one
++// anchor per drafting sequence must fit in llama_n_batch(ctx_dft).
++#include "speculative.h"
++
++#undef NDEBUG
++#include <cassert>
++#include <cstdio>
++
++int main() {
++    // full-prefill boundary: n_max=31, n_batch=32, one 32-token prompt stash
++    assert(common_speculative_mtp_first_decode_fits(32, 31, 1));
++    assert(!common_speculative_mtp_first_decode_fits(32, 32, 1));
++
++    // two sequences, combined catch-up plus two anchors
++    assert(common_speculative_mtp_first_decode_fits(32, 15 + 15, 2));
++    assert(!common_speculative_mtp_first_decode_fits(32, 16 + 16, 2));
++
++    assert(!common_speculative_mtp_first_decode_fits(0, 0, 0));
++    assert(!common_speculative_mtp_first_decode_fits(32, -1, 1));
++
++    printf("ok\n");
++    return 0;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 102da8f..d3313e3 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -206,6 +206,11 @@ struct server_slot {
+ 
+     // speculative decoding
+     common_speculative * spec;
++    int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
++    int32_t spec_n_max       = 0; // draft size (--spec-draft-n-max) below spec_tail_depth
++    int32_t spec_n_max_tail  = 0; // draft size from spec_tail_depth on (--spec-draft-n-max-tail, 0 = spec_n_max)
++    int32_t spec_tail_depth  = 0; // start of the tiered-KV host tail (--kv-vram-cells, 0 = none)
++    int32_t spec_n_max_lookup = 0; // draft size for the lookup drafters (--spec-lookup-n-max, 0 = the cap above)
+ 
+     llama_tokens spec_draft;
+     llama_tokens spec_prompt;
+@@ -443,6 +448,12 @@ struct server_slot {
+             return 0;
+         }
+ 
++        // deep in the context the draft passes and the multi-column verify cost more than the
++        // accepted tokens save (see --spec-draft-depth-max); decode one token per step from here
++        if (spec_depth_max > 0 && prompt.n_tokens() > spec_depth_max) {
++            return 0;
++        }
++
+         // determine the max draft that fits the current slot state
+         // note: slot.prompt is not yet expanded with the `id` token sampled above
+         //       also, need to leave space for 1 extra token to allow context shifts
+@@ -452,11 +463,31 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+         }
+ 
++        // past the tiered-KV line a step is bound by reading the host tail over PCIe, and a wider verify
++        // batch reads it once for all columns: draft --spec-draft-n-max-tail there, --spec-draft-n-max below
++        const bool tail = spec_tail_depth > 0 && spec_n_max_tail > 0 && prompt.n_tokens() >= spec_tail_depth;
++        const int32_t cap = tail ? spec_n_max_tail : spec_n_max;
++        if (cap > 0) {
++            n_draft_max = std::min(n_draft_max, (int) cap);
++        }
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+     }
+ 
++    // the same limits for the lookup drafters, with --spec-lookup-n-max in place of the model drafter's cap
++    int get_n_draft_max_lookup() const {
++        if (spec_n_max_lookup <= 0) {
++            return 0;
++        }
++        int n = n_ctx - prompt.n_tokens() - 2;
++        if (n_remaining() > 0) {
++            n = std::min(n, n_remaining() - 1);
++        }
++        return std::max(0, std::min(n, (int) spec_n_max_lookup));
++    }
++
+     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
+     void handle_last_sampled_token(server_batch & batch) {
+         bool add_ok = true;
+@@ -843,6 +874,7 @@ private:
+     llama_context * ctx_dft   = nullptr;
+ 
+     common_speculative_init_result_ptr spec_init;
++    int32_t spec_n_max = 0; // --spec-draft-n-max as given (the drafter is built for max(n_max, n_max_tail))
+ 
+     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+@@ -965,6 +997,12 @@ private:
+         const bool is_resume = sleeping;
+ 
+         params_base = params;
++
++        // the drafter and the output limits are built for the larger of the two draft sizes; each slot caps a
++        // draft to --spec-draft-n-max below the tiered-KV line (see server_slot::get_n_draft_max)
++        spec_n_max = params_base.speculative.draft.n_max;
++        params_base.speculative.draft.n_max = std::max(params_base.speculative.draft.n_max, params_base.speculative.draft.n_max_tail);
++
+         const auto output_limits = server_output_limits(params_base);
+         params_base.n_outputs_max = output_limits.total;
+         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+@@ -1238,6 +1276,11 @@ private:
+             slot.ctx_dft = ctx_dft;
+             slot.mem.init(ctx_tgt, ctx_dft);
+             slot.spec    = spec.get();
++            slot.spec_depth_max  = params_base.speculative.draft.n_depth_max;
++            slot.spec_n_max      = spec_n_max;
++            slot.spec_n_max_tail = params_base.speculative.draft.n_max_tail;
++            slot.spec_tail_depth = params_base.n_kv_vram_cells;
++            slot.spec_n_max_lookup = params_base.speculative.draft.n_max_lookup;
+             slot.n_ctx   = n_ctx_slot;
+ 
+             slot.stats.speculative = slot.can_speculate();
+@@ -2946,6 +2989,7 @@ private:
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
++                            /* .n_max_lookup = */ slot.get_n_draft_max_lookup(),
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -3655,7 +3699,35 @@ private:
+         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+         //       for now, always re-evaluate for simplicity
+         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+-        if (spec) {
++        // past --spec-draft-depth-max a slot does not draft, so its draft context has no use for
++        // these rows: skip the hook (and the draft-model decode it implies) when every token of this
++        // view sits beyond the cutoff. Positions, not the slot's token count, decide it, so the early
++        // ubatches of a long prompt still reach the draft context and stay reusable as a prefix.
++        bool spec_process = spec != nullptr;
++        if (spec_process && params_base.speculative.draft.n_depth_max > 0) {
++            spec_process = false;
++            for (int i = 0; i < batch_view.n_tokens && !spec_process; ++i) {
++                spec_process = batch_view.pos[i] <= params_base.speculative.draft.n_depth_max;
++            }
++        }
++
++        // --spec-draft-window: before feeding this view to the draft context, drop its rows older than the window.
++        // The draft context is sized for the window (common_speculative_init), so freed cells are reused and its
++        // attention span stays short; the MTP head predicts the next few tokens from recent context.
++        if (spec_process && ctx_dft && params_base.speculative.draft.n_window > 0) {
++            llama_pos pos_min = std::numeric_limits<llama_pos>::max();
++            for (int i = 0; i < batch_view.n_tokens; ++i) {
++                pos_min = std::min(pos_min, batch_view.pos[i]);
++            }
++            const llama_pos hi = pos_min - params_base.speculative.draft.n_window;
++            if (hi > 0) {
++                for (auto & slot : slots) {
++                    llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, 0, hi);
++                }
++            }
++        }
++
++        if (spec_process) {
+             bool ok = true;
+             queue_tasks.yield_to_queue([&]() {
+                 ok = common_speculative_process(spec.get(), batch_view);

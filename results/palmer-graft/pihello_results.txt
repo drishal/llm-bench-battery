@@ -1,0 +1,17 @@
+pi-hello palmer graft A/B — 2026-10-09 10:00:15 — desktop VRAM 24 MiB
+ctrl=/home/drishal/src/llama.cpp-prism-ptq1fast/result-g244/bin/llama-server
+
+===== CTRL_a  llama-server =====
+  loaded in 2s
+  rc=0 wall=150.0s | largest prefill: 143832.97 ms / 43912 tokens (    3.28 ms per token,   305.30 tokens per second)
+  reply: Hi! Ready to pick up where things left off. What's the plan? 
+RESULT CTRL_a wall=150.0s
+
+===== GRAFT_a  llama-server =====
+  loaded in 2s
+  rc=0 wall=147.5s | largest prefill: 144385.26 ms / 43912 tokens (    3.29 ms per token,   304.13 tokens per second)
+  reply: Hello! I'm ready to help. What would you like to work on? I can help with: - Your local LL
+RESULT GRAFT_a wall=147.5s
+
+===== CTRL_b  llama-server =====
+  loaded in 2s

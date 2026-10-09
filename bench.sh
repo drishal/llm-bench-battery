@@ -19,7 +19,9 @@
 #   BENCH_TEMP/BENCH_TOP_P/BENCH_TOP_K/BENCH_PRESENCE/BENCH_MIN_P   per-run sampling overrides
 #
 # Results (git-ignored): results/<label>_battery.txt (+ _server.log, _pi.txt).
-# Compare:  grep -H SCORECARD results/*_battery.txt
+# Compare:  grep -hE "SCORECARD" results/*_battery.txt results/*_pi.txt
+#   _battery.txt -> SCORECARD        (R1/R2/C1/C2/K_cold/K_ctx, single-shot)
+#   _pi.txt      -> PAGODA_SCORECARD (agentic: score/10, toolCalls, selfVerified)
 set -u
 HERE="$(cd "$(dirname "$0")" && echo "$PWD")"
 SESSION="bench"
@@ -41,7 +43,8 @@ tmux set-option -t "$SESSION" history-limit 200000 \; \
 # forward optional env into the pane
 ENVPASS=""
 for v in LAUNCHER SERVE_EXTRA PI_PROBE_DIR SUFFIX \
-         BENCH_TEMP BENCH_TOP_P BENCH_TOP_K BENCH_PRESENCE BENCH_MIN_P; do
+         BENCH_TEMP BENCH_TOP_P BENCH_TOP_K BENCH_PRESENCE BENCH_MIN_P \
+         BENCH_ONLY BENCH_SEED BENCH_R1_MAXTOK BENCH_SAVE_TRACES BENCH_SKIP_PI PI_THINKING PI_ONLY; do
   val="${!v:-}"; [ -n "$val" ] && ENVPASS="$ENVPASS $v=$(printf '%q' "$val")"
 done
 CMD="bash '$HERE/_bench_run.sh' '$PORT' '$SUFFIX' ${MODELS[*]}"

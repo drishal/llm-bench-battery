@@ -1,0 +1,22 @@
+PROBE rewrite_4k in=23670 out=512 pp=406 tg=41.1 pp_ms=58330 tg_ms=12443
+PROBE rewrite_12k in=12922 out=512 pp=446 tg=42.9 pp_ms=28953 tg_ms=11913
+PROBE tools100 in=9351 out=76 pp=459 tg=41.7 pp_ms=20368 tg_ms=1797
+PROBE prose_control in=65 out=320 pp=140 tg=45.6 pp_ms=463 tg_ms=6989
+PROBE rewrite_4k in=23670 out=512 pp=403 tg=41.0 pp_ms=58790 tg_ms=12455
+PROBE rewrite_12k in=12922 out=512 pp=444 tg=42.9 pp_ms=29090 tg_ms=11908
+PROBE tools100 in=9351 out=69 pp=459 tg=42.1 pp_ms=20386 tg_ms=1614
+PROBE prose_control in=65 out=320 pp=139 tg=45.7 pp_ms=469 tg_ms=6986
+PROBE rewrite_4k in=23670 out=512 pp=376 tg=39.8 pp_ms=62881 tg_ms=12845 draft_n=743
+PROBE rewrite_12k in=12922 out=512 pp=421 tg=42.0 pp_ms=30719 tg_ms=12174 draft_n=775
+PROBE tools100 in=9351 out=69 pp=434 tg=69.6 pp_ms=21527 tg_ms=977 draft_n=60
+PROBE prose_control in=65 out=320 pp=126 tg=53.8 pp_ms=516 tg_ms=5930 draft_n=429
+PROBE rewrite_4k in=23670 out=512 pp=377 tg=41.7 pp_ms=62708 tg_ms=12251 draft_n=709 head=""
+PROBE rewrite_12k in=12922 out=512 pp=421 tg=44.4 pp_ms=30676 tg_ms=11522 draft_n=736 head=""
+PROBE rewrite_verbatim in=12887 out=512 pp=418 tg=41.2 pp_ms=30808 tg_ms=12409 draft_n=792 head=""
+PROBE tools100 in=9351 out=78 pp=432 tg=70.4 pp_ms=21654 tg_ms=1093 draft_n=66 toolcall=fn_042
+PROBE prose_control in=65 out=320 pp=123 tg=45.2 pp_ms=527 tg_ms=7058 draft_n=510 head=""
+PROBE rewrite_4k in=23670 out=512 pp=402 tg=41.0 pp_ms=58950 tg_ms=12463 head=""
+PROBE rewrite_12k in=12922 out=512 pp=440 tg=42.9 pp_ms=29374 tg_ms=11915 head=""
+PROBE rewrite_verbatim in=12887 out=512 pp=439 tg=42.9 pp_ms=29379 tg_ms=11912 head=""
+PROBE tools100 in=9351 out=67 pp=452 tg=42.2 pp_ms=20684 tg_ms=1566 toolcall=fn_042
+PROBE prose_control in=65 out=320 pp=140 tg=45.6 pp_ms=464 tg_ms=6997 head=""

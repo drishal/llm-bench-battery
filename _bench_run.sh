@@ -47,7 +47,7 @@ for M in "$@"; do
   # 1) graded battery (streaming, colored)
   python3 "$HERE/battery.py" "$LABEL"
   # 2) pi agentic tests (skips itself if `pi` is not installed)
-  PORT="$PORT" "$HERE/pitest.sh" "$LABEL"
+  [ "${BENCH_SKIP_PI:-}" = 1 ] || PORT="$PORT" "$HERE/pitest.sh" "$LABEL"
 
   [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
   sleep 3

@@ -41,6 +41,19 @@ TOPP_OVERRIDE = os.environ.get("BENCH_TOP_P")
 TOPK_OVERRIDE = os.environ.get("BENCH_TOP_K")
 PRES_OVERRIDE = os.environ.get("BENCH_PRESENCE")
 MINP_OVERRIDE = os.environ.get("BENCH_MIN_P")
+SEED_OVERRIDE = os.environ.get("BENCH_SEED")   # fixed seed -> reproducible even at temp>0;
+                                              # REQUIRED for A/B: without it, run-to-run spiral
+                                              # variance (measured up to ~4x on think length)
+                                              # swamps any config effect.
+REFF_OVERRIDE = os.environ.get("BENCH_REASONING_EFFORT")   # e.g. xhigh|high|medium|low (Qwen3.8 top-level field); None -> model default
+# ⚠ was hardcoded 1200 s. A slow backend (PQ2_0 on ROCm: 13-19 tok/s deep in a 65k ctx)
+# blows through that on R1 alone and the TimeoutError kills the WHOLE run at the first test,
+# leaving a 2-line results file and no scorecard. Raise it for slow arms.
+HTTP_TIMEOUT  = int(os.environ.get("BENCH_TIMEOUT", "1200"))
+R1_MAXTOK     = int(os.environ.get("BENCH_R1_MAXTOK", "32000"))  # high-effort reasoners (e.g. Qwen3.8 xhigh) need room; models that don't stop early via finish=stop. Raise near ctx (e.g. 63000) for very deep reasoning
+# BENCH_ONLY=R1  (or "R1,C1") runs just those tests, reusing the same live server. Empty -> all.
+ONLY = {t.strip().upper() for t in os.environ.get("BENCH_ONLY", "").split(",") if t.strip()}
+def sel(k): return (not ONLY) or k.upper() in ONLY
 _NOCOL        = bool(os.environ.get("NO_COLOR"))
 
 class Cx:
@@ -65,6 +78,8 @@ def _body(messages, mt):
     if TOPK_OVERRIDE is not None: b["top_k"] = int(TOPK_OVERRIDE)
     if PRES_OVERRIDE is not None: b["presence_penalty"] = float(PRES_OVERRIDE)
     if MINP_OVERRIDE is not None: b["min_p"] = float(MINP_OVERRIDE)
+    if REFF_OVERRIDE:             b["reasoning_effort"] = REFF_OVERRIDE
+    if SEED_OVERRIDE is not None: b["seed"] = int(SEED_OVERRIDE)
     return b
 
 def ask(messages, mt=14000):
@@ -74,7 +89,7 @@ def ask_block(messages, mt):
     b = json.dumps(_body(messages, mt)).encode()
     t = time.time()
     r = urllib.request.urlopen(
-        urllib.request.Request(URL, b, {"Content-Type": "application/json"}), timeout=1200)
+        urllib.request.Request(URL, b, {"Content-Type": "application/json"}), timeout=HTTP_TIMEOUT)
     d = json.load(r); dt = time.time() - t
     m = d["choices"][0]["message"]; u = d.get("usage", {})
     return (m.get("content", "") or "", m.get("reasoning_content", "") or "",
@@ -86,7 +101,7 @@ def ask_stream(messages, mt):
     b = json.dumps(body).encode()
     t = time.time()
     r = urllib.request.urlopen(
-        urllib.request.Request(URL, b, {"Content-Type": "application/json"}), timeout=1200)
+        urllib.request.Request(URL, b, {"Content-Type": "application/json"}), timeout=HTTP_TIMEOUT)
     content, reasoning, tok, fr, mode = [], [], 0, None, None
     for raw in r:
         line = raw.decode("utf-8", "replace").strip()
@@ -139,9 +154,22 @@ def run_py(code, test, timeout=20):
         except OSError: pass
 
 results = {}
+# BENCH_SAVE_TRACES=1 -> persist each phase's raw reasoning_content to
+# results/<label>_traces/<tag>.txt so quant-to-quant trace diffs are possible.
+# Off by default: traces are large and most runs don't need them.
+SAVE_TRACES = os.environ.get("BENCH_SAVE_TRACES") == "1"
+TRACEDIR = OUT / f"{LABEL}_traces"
+if SAVE_TRACES: TRACEDIR.mkdir(exist_ok=True)
+
 def header(tag, c, rc, tok, dt, fr):
     log(f"\n{'='*70}\n{tag}  ({dt:.1f}s, think={len(rc)}c, out={tok}tok, "
         f"{(tok/dt if dt else 0):.1f} tok/s, finish={fr})\n{'='*70}", c=Cx.yel)
+    if SAVE_TRACES:
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", tag.split("(")[0].strip())[:40] or "phase"
+        meta = (f"# label={LABEL} tag={tag}\n# dt={dt:.1f}s think_chars={len(rc)} "
+                f"out_tok={tok} finish={fr}\n{'-'*70}\n")
+        (TRACEDIR / f"{slug}.think.txt").write_text(meta + (rc or ""))
+        (TRACEDIR / f"{slug}.answer.txt").write_text(meta + (c or ""))
 def grade(key, val, ok):
     results[key] = val
     log(f">>> {key} GRADE: {val}", c=(Cx.grn if ok else Cx.red))
@@ -152,11 +180,12 @@ heavier OR lighter, and you do not know which. Using a balance scale at most 3 t
 give a complete strategy that ALWAYS identifies which ball is the odd one AND whether
 it is heavier or lighter, for every one of the 24 possible cases. Present the full
 decision tree concisely."""
-phase("R1 12-ball weighing (reasoning; manual grade)")
-c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
-header("R1 12-BALL (reasoning; manual grade)", c, rc, tok, dt, fr)
-log(c.strip()[:2600])
-results["R1_12ball"] = "MANUAL"
+if sel("R1"):
+    phase("R1 12-ball weighing (reasoning; manual grade)")
+    c, rc, tok, dt, fr = ask([{"role": "user", "content": P}], mt=R1_MAXTOK)
+    header("R1 12-BALL (reasoning; manual grade)", c, rc, tok, dt, fr)
+    log(c.strip()[:2600])
+    results["R1_12ball"] = "MANUAL"
 
 # ---------------- R2: zebra puzzle (auto: German) ----------------
 P = """Solve this logic puzzle. Five houses in a row (positions 1-5, left to right).
@@ -176,15 +205,16 @@ P = """Solve this logic puzzle. Five houses in a row (positions 1-5, left to rig
 14. The Norwegian lives next to the blue house.
 15. The man who smokes Blend has a neighbour who drinks water.
 Question: WHO OWNS THE FISH? Answer with the nationality on the final line as: ANSWER: <nationality>"""
-phase("R2 zebra 5-house puzzle (reasoning; auto=German)")
-c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
-header("R2 ZEBRA (reasoning; auto, correct=German)", c, rc, tok, dt, fr)
-log(c.strip()[-1200:])
-mm = re.search(r"ANSWER:\s*([A-Za-z]+)", c)
-ans = (mm.group(1) if mm else "").lower()
-if not ans:
-    ans = "german" if re.search(r"german[^.]{0,40}fish|fish[^.]{0,40}german", c, re.I) else "?"
-grade("R2_zebra", "PASS" if ans == "german" else f"FAIL(said {ans})", ans == "german")
+if sel("R2"):
+    phase("R2 zebra 5-house puzzle (reasoning; auto=German)")
+    c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
+    header("R2 ZEBRA (reasoning; auto, correct=German)", c, rc, tok, dt, fr)
+    log(c.strip()[-1200:])
+    mm = re.search(r"ANSWER:\s*([A-Za-z]+)", c)
+    ans = (mm.group(1) if mm else "").lower()
+    if not ans:
+        ans = "german" if re.search(r"german[^.]{0,40}fish|fish[^.]{0,40}german", c, re.I) else "?"
+    grade("R2_zebra", "PASS" if ans == "german" else f"FAIL(said {ans})", ans == "german")
 
 # ---------------- C1: thread-safe token bucket ----------------
 P = """Write a THREAD-SAFE token bucket rate limiter in Python with EXACTLY this API:
@@ -196,30 +226,31 @@ P = """Write a THREAD-SAFE token bucket rate limiter in Python with EXACTLY this
 The bucket starts FULL (capacity tokens). It must be correct under concurrent access
 from many threads (no race conditions, never grant more tokens than available).
 Return ONLY a fenced python code block."""
-phase("C1 thread-safe token-bucket rate limiter (coding; 20-thread race test)")
-c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
-header("C1 RATE-LIMITER (coding; run 20-thread test)", c, rc, tok, dt, fr)
-code = extract_code(c); log(code[:1500])
-test = textwrap.dedent("""
-    import threading
-    rl=TokenBucketRateLimiter(capacity=100, refill_rate=0)  # no refill
-    grants=[]; lock=threading.Lock()
-    def worker():
-        local=0
-        for _ in range(50):
-            if rl.try_acquire(1): local+=1
-        with lock: grants.append(local)
-    ts=[threading.Thread(target=worker) for _ in range(20)]
-    for t in ts: t.start()
-    for t in ts: t.join()
-    total=sum(grants)
-    print("TOTAL_GRANTED",total)
-    assert total==100, f"expected 100 got {total} (race or wrong count)"
-    print("ALLPASS")
-""")
-ok, out = run_py(code, test)
-log(f"[test output] {out}")
-grade("C1_ratelimiter", "PASS" if ok else "FAIL", ok)
+if sel("C1"):
+    phase("C1 thread-safe token-bucket rate limiter (coding; 20-thread race test)")
+    c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
+    header("C1 RATE-LIMITER (coding; run 20-thread test)", c, rc, tok, dt, fr)
+    code = extract_code(c); log(code[:1500])
+    test = textwrap.dedent("""
+        import threading
+        rl=TokenBucketRateLimiter(capacity=100, refill_rate=0)  # no refill
+        grants=[]; lock=threading.Lock()
+        def worker():
+            local=0
+            for _ in range(50):
+                if rl.try_acquire(1): local+=1
+            with lock: grants.append(local)
+        ts=[threading.Thread(target=worker) for _ in range(20)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        total=sum(grants)
+        print("TOTAL_GRANTED",total)
+        assert total==100, f"expected 100 got {total} (race or wrong count)"
+        print("ALLPASS")
+    """)
+    ok, out = run_py(code, test)
+    log(f"[test output] {out}")
+    grade("C1_ratelimiter", "PASS" if ok else "FAIL", ok)
 
 # ---------------- C2: word_break DP ----------------
 P = """Write a Python function with EXACTLY this signature:
@@ -229,32 +260,33 @@ P = """Write a Python function with EXACTLY this signature:
 Return True iff s can be segmented into a space-separated sequence of one or more
 words, each of which is present in the list `words` (words may be reused). Otherwise
 False. Return ONLY a fenced python code block."""
-phase("C2 word_break DP (coding; hidden tests)")
-c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
-header("C2 WORD-BREAK (coding; hidden tests)", c, rc, tok, dt, fr)
-code = extract_code(c); log(code[:900])
-test = textwrap.dedent("""
-    cases=[
-      ("leetcode",["leet","code"],True),
-      ("applepenapple",["apple","pen"],True),
-      ("catsandog",["cats","dog","sand","and","cat"],False),
-      ("cars",["car","ca","rs"],True),
-      ("abcd",["a","abc","b","d"],True),
-      ("abcd",["a","abc","bd"],False),
-      ("aaaaaaaaab",["a","aa","aaa"],False),
-    ]
-    bad=[]
-    for s,w,exp in cases:
-        try: got=word_break(s,w)
-        except Exception as e: got=f"ERR:{e}"
-        if got!=exp: bad.append((s,exp,got))
-    print("FAILURES",bad if bad else "none")
-    assert not bad
-    print("ALLPASS")
-""")
-ok, out = run_py(code, test)
-log(f"[test output] {out}")
-grade("C2_wordbreak", "PASS" if ok else "FAIL", ok)
+if sel("C2"):
+    phase("C2 word_break DP (coding; hidden tests)")
+    c, rc, tok, dt, fr = ask([{"role": "user", "content": P}])
+    header("C2 WORD-BREAK (coding; hidden tests)", c, rc, tok, dt, fr)
+    code = extract_code(c); log(code[:900])
+    test = textwrap.dedent("""
+        cases=[
+          ("leetcode",["leet","code"],True),
+          ("applepenapple",["apple","pen"],True),
+          ("catsandog",["cats","dog","sand","and","cat"],False),
+          ("cars",["car","ca","rs"],True),
+          ("abcd",["a","abc","b","d"],True),
+          ("abcd",["a","abc","bd"],False),
+          ("aaaaaaaaab",["a","aa","aaa"],False),
+        ]
+        bad=[]
+        for s,w,exp in cases:
+            try: got=word_break(s,w)
+            except Exception as e: got=f"ERR:{e}"
+            if got!=exp: bad.append((s,exp,got))
+        print("FAILURES",bad if bad else "none")
+        assert not bad
+        print("ALLPASS")
+    """)
+    ok, out = run_py(code, test)
+    log(f"[test output] {out}")
+    grade("C2_wordbreak", "PASS" if ok else "FAIL", ok)
 
 # ---------------- K: fictional API — cold vs with-context ----------------
 KQ = ("Using the zephyrdb library, write a function `count_active_users(dsn)` that: opens a "
@@ -282,20 +314,21 @@ def grade_zephyr(code):
               and re.search(r"\bwith\s+" + re.escape(_m.group(1)) + r"\b", code))
       ),
     }
-phase("K-cold zephyrdb (parametric knowledge of a FICTIONAL API — no context)")
-c, rc, tok, dt, fr = ask([{"role": "user", "content": KQ}])
-header("K-COLD zephyrdb (no context — parametric knowledge of a FICTIONAL API)", c, rc, tok, dt, fr)
-code = extract_code(c); ch = grade_zephyr(code)
-log(code[:700]); log(f"checks: {ch}")
-results["K_cold"] = f"{sum(ch.values())}/6"
-log(f">>> K_cold GRADE: {results['K_cold']}", c=Cx.yel)
-phase("K-ctx zephyrdb (WITH doc in context — 'harness provides knowledge')")
-c, rc, tok, dt, fr = ask([{"role": "system", "content": DOC}, {"role": "user", "content": KQ}])
-header("K-CTX zephyrdb (WITH doc in context — the 'harness provides knowledge' case)", c, rc, tok, dt, fr)
-code = extract_code(c); ch = grade_zephyr(code)
-log(code[:900]); log(f"checks: {ch}")
-results["K_ctx"] = f"{sum(ch.values())}/6"
-log(f">>> K_ctx GRADE: {results['K_ctx']}", c=Cx.grn)
+if sel("K"):
+    phase("K-cold zephyrdb (parametric knowledge of a FICTIONAL API — no context)")
+    c, rc, tok, dt, fr = ask([{"role": "user", "content": KQ}])
+    header("K-COLD zephyrdb (no context — parametric knowledge of a FICTIONAL API)", c, rc, tok, dt, fr)
+    code = extract_code(c); ch = grade_zephyr(code)
+    log(code[:700]); log(f"checks: {ch}")
+    results["K_cold"] = f"{sum(ch.values())}/6"
+    log(f">>> K_cold GRADE: {results['K_cold']}", c=Cx.yel)
+    phase("K-ctx zephyrdb (WITH doc in context — 'harness provides knowledge')")
+    c, rc, tok, dt, fr = ask([{"role": "system", "content": DOC}, {"role": "user", "content": KQ}])
+    header("K-CTX zephyrdb (WITH doc in context — the 'harness provides knowledge' case)", c, rc, tok, dt, fr)
+    code = extract_code(c); ch = grade_zephyr(code)
+    log(code[:900]); log(f"checks: {ch}")
+    results["K_ctx"] = f"{sum(ch.values())}/6"
+    log(f">>> K_ctx GRADE: {results['K_ctx']}", c=Cx.grn)
 
 log(f"\n{'#'*70}", c=Cx.cyn)
 log(f"SCORECARD [{LABEL}]: " + json.dumps(results), c=Cx.cyn)

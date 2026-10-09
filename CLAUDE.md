@@ -245,8 +245,9 @@ defaults are often wrong and silently tank scores:
     *Do not lower it thinking "coding wants low temp"* — Unsloth prescribes 1.0 for all uses.
   - **KAT-Coder** — its card says temp 1.0 + presence 1.5; empirically ~0.7 + presence 1.5
     is steadier for deterministic tasks. (Card vs. measured can disagree — note both.)
-  - **Bonsai (ternary)** — official PrismML is temp **0.5** / top_p 0.85 / top_k 20 /
-    min_p 0 / **no** presence (an earlier "0.7 + presence 1.0" note was wrong).
+  - **Bonsai 2 (ternary, Qwen3.8-based)** — card preset (thinking) is temp **1.0** / top_p 0.95 /
+    top_k 20 / min_p 0 / no presence. The old 0.5 / 0.85 / 20 preset is **gen-1 Bonsai only**; the MTP
+    grafts silently fell back to it until 2026-09-28. MTP depth picks flip with temp — measure at 1.0.
   - **LFM2** — temp 0.3, min_p 0.15, needs `--jinja`.
 - **Runaways**: reasoning models can fail to terminate (`finish=length`, huge think, no
   answer). The battery caps at 14000 tokens; a runaway shows as `finish=length`. That's a
@@ -295,8 +296,9 @@ defaults are often wrong and silently tank scores:
   desktop stutters *only during the cold prefill* (decode/cached turns are smooth). Fixes:
   drive the display from the iGPU (leave the dGPU headless), use an MoE for big prompts,
   shrink the prompt, or lower `-ub`. It's contention, not a hard limit.
-- **Ternary / very-low-bit (Bonsai 1.71 bpw) confabulates identifiers** (URLs, PIDs,
-  proper nouns) even when structurally right — feed it docs (K_ctx), never trust cold recall.
+- **Gen-1 Bonsai (Q2_0) confabulated identifiers** (URLs, PIDs, proper nouns) even when structurally
+  right. Bonsai 2 passed the same hermes probe (2026-09-27, n=1) but still has weak cold recall —
+  feed it docs (K_ctx) for anything factual.
 
 ## Running-the-harness footguns
 - **pi renders to a TTY only** — a piped `pi -p | …` captures nothing. Use a real PTY:

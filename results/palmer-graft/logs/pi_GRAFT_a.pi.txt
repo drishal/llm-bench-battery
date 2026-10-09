@@ -1,0 +1,8 @@
+Warning: Model "local-model" not found for provider "local-model". Using custom model id.
+Hello! I'm ready to help. What would you like to work on?
+
+I can help with:
+- Your local LLM benchmark setup
+- Model serving and tuning on your RX 6800 XT
+- The bench battery and agentic tests
+- Any coding, analysis, or automation task in this workspace

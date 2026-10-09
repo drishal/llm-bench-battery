@@ -1,0 +1,2 @@
+Warning: Model "local-model" not found for provider "local-model". Using custom model id.
+Hi! Ready to pick up where things left off. What's the plan?
